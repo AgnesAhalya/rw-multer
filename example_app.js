@@ -1,3 +1,4 @@
+
 'use strict';
 
 const crypto = require('crypto');
@@ -10,7 +11,7 @@ const multer = require('./index');
 const app = express();
 
 const PORT = parsePort(process.env.PORT, 3000);
-const HOST = process.env.HOST || '0.0.0.0';
+const HOST = process.env.HOST || '127.0.0.1';
 const UPLOAD_DIRECTORY = path.resolve(
   process.env.UPLOAD_DIRECTORY || path.join(__dirname, 'uploads')
 );
@@ -21,18 +22,29 @@ const MAX_MEMORY_FILE_SIZE = 2 * 1024 * 1024;
 const ALLOWED_MIME_TYPES = new Set([
   'application/pdf',
   'image/jpeg',
-  'image/png',
-  'text/plain'
+  'image/png'
 ]);
 
 ensureUploadDirectory(UPLOAD_DIRECTORY);
 
 app.disable('x-powered-by');
+app.set('case sensitive routing', true);
+app.set('strict routing', true);
 
-app.use(express.json({ limit: '100kb' }));
+app.use(assignRequestId);
+app.use(setSecurityHeaders);
+
+app.use(express.json({
+  limit: '100kb',
+  strict: true,
+  type: 'application/json'
+}));
+
 app.use(express.urlencoded({
   extended: false,
-  limit: '100kb'
+  limit: '100kb',
+  parameterLimit: 50,
+  type: 'application/x-www-form-urlencoded'
 }));
 
 const diskStorage = multer.diskStorage({
@@ -42,12 +54,8 @@ const diskStorage = multer.diskStorage({
 
   filename(req, file, callback) {
     try {
-      const extension = sanitiseExtension(
-        path.extname(file.originalname || '')
-      );
-
-      const generatedName =
-        `${Date.now()}-${crypto.randomUUID()}${extension}`;
+      const extension = extensionForMimeType(file.mimetype);
+      const generatedName = `${crypto.randomUUID()}${extension}`;
 
       callback(null, generatedName);
     } catch (error) {
@@ -68,17 +76,15 @@ const diskUpload = multer({
   },
 
   fileFilter(req, file, callback) {
-    if (!file || typeof file.mimetype !== 'string') {
-      return callback(
-        createHttpError(400, 'Invalid uploaded file metadata')
-      );
-    }
-
-    if (!ALLOWED_MIME_TYPES.has(file.mimetype)) {
+    if (
+      !file ||
+      typeof file.mimetype !== 'string' ||
+      !ALLOWED_MIME_TYPES.has(file.mimetype)
+    ) {
       return callback(
         createHttpError(
           415,
-          `Unsupported file type: ${file.mimetype}`
+          'UNSUPPORTED_MEDIA_TYPE'
         )
       );
     }
@@ -99,9 +105,16 @@ const memoryUpload = multer({
   },
 
   fileFilter(req, file, callback) {
-    if (!file || !ALLOWED_MIME_TYPES.has(file.mimetype)) {
+    if (
+      !file ||
+      typeof file.mimetype !== 'string' ||
+      !ALLOWED_MIME_TYPES.has(file.mimetype)
+    ) {
       return callback(
-        createHttpError(415, 'Unsupported file type')
+        createHttpError(
+          415,
+          'UNSUPPORTED_MEDIA_TYPE'
+        )
       );
     }
 
@@ -112,254 +125,188 @@ const memoryUpload = multer({
 app.get('/health', function healthRoute(req, res) {
   res.status(200).json({
     status: 'ok',
-    service: 'upload-test-service',
-    timestamp: new Date().toISOString()
+    requestId: req.requestId
   });
 });
 
 app.get('/', function indexRoute(req, res) {
   res.status(200).json({
-    service: 'Upload test application',
-    routes: [
-      {
-        method: 'POST',
-        path: '/upload/single',
-        fileField: 'avatar'
-      },
-      {
-        method: 'POST',
-        path: '/upload/array',
-        fileField: 'documents'
-      },
-      {
-        method: 'POST',
-        path: '/upload/fields',
-        fileFields: ['avatar', 'gallery']
-      },
-      {
-        method: 'POST',
-        path: '/upload/any'
-      },
-      {
-        method: 'POST',
-        path: '/upload/text'
-      },
-      {
-        method: 'POST',
-        path: '/upload/memory',
-        fileField: 'file'
-      },
-      {
-        method: 'POST',
-        path: '/form/fields'
-      },
-      {
-        method: 'POST',
-        path: '/form/batch',
-        fileField: 'attachments'
-      }
-    ]
+    service: 'upload-service',
+    requestId: req.requestId
   });
 });
 
 app.post(
   '/upload/single',
+  requireMultipart,
   diskUpload.single('avatar'),
   asyncRoute(async function singleUploadRoute(req, res) {
     if (!req.file) {
-      throw createHttpError(
-        400,
-        'A file is required in the "avatar" field'
-      );
+      throw createHttpError(400, 'INVALID_REQUEST');
     }
+
+    await validateDiskFiles([req.file]);
 
     res.status(201).json({
       success: true,
-      body: req.body,
-      file: serialiseDiskFile(req.file)
+      requestId: req.requestId,
+      file: serialiseFile(req.file)
     });
   })
 );
 
 app.post(
   '/upload/array',
+  requireMultipart,
   diskUpload.array('documents', 10),
   asyncRoute(async function arrayUploadRoute(req, res) {
-    const files = Array.isArray(req.files)
-      ? req.files
-      : [];
+    const files = asFileArray(req.files);
 
     if (files.length === 0) {
-      throw createHttpError(
-        400,
-        'At least one file is required in the "documents" field'
-      );
+      throw createHttpError(400, 'INVALID_REQUEST');
     }
+
+    await validateDiskFiles(files);
 
     res.status(201).json({
       success: true,
-      body: req.body,
+      requestId: req.requestId,
       fileCount: files.length,
-      files: files.map(serialiseDiskFile)
+      files: files.map(serialiseFile)
     });
   })
 );
 
 app.post(
   '/upload/fields',
+  requireMultipart,
   diskUpload.fields([
-    {
-      name: 'avatar',
-      maxCount: 1
-    },
-    {
-      name: 'gallery',
-      maxCount: 5
-    }
+    { name: 'avatar', maxCount: 1 },
+    { name: 'gallery', maxCount: 5 }
   ]),
   asyncRoute(async function fieldsUploadRoute(req, res) {
-    const files = req.files || {};
-    const avatar = Array.isArray(files.avatar)
-      ? files.avatar
-      : [];
-    const gallery = Array.isArray(files.gallery)
-      ? files.gallery
-      : [];
+    const files = collectFilesFromRequest(req);
 
-    if (avatar.length === 0 && gallery.length === 0) {
-      throw createHttpError(
-        400,
-        'An avatar or gallery file is required'
-      );
+    if (files.length === 0) {
+      throw createHttpError(400, 'INVALID_REQUEST');
     }
+
+    await validateDiskFiles(files);
 
     res.status(201).json({
       success: true,
-      body: req.body,
-      files: {
-        avatar: avatar.map(serialiseDiskFile),
-        gallery: gallery.map(serialiseDiskFile)
-      }
+      requestId: req.requestId,
+      fileCount: files.length,
+      files: files.map(serialiseFile)
     });
   })
 );
 
 app.post(
   '/upload/any',
+  requireMultipart,
   diskUpload.any(),
   asyncRoute(async function anyUploadRoute(req, res) {
-    const files = Array.isArray(req.files)
-      ? req.files
-      : [];
+    const files = asFileArray(req.files);
 
     if (files.length === 0) {
-      throw createHttpError(
-        400,
-        'At least one uploaded file is required'
-      );
+      throw createHttpError(400, 'INVALID_REQUEST');
     }
+
+    await validateDiskFiles(files);
 
     res.status(201).json({
       success: true,
-      body: req.body,
+      requestId: req.requestId,
       fileCount: files.length,
-      files: files.map(serialiseDiskFile)
+      files: files.map(serialiseFile)
     });
   })
 );
 
 app.post(
   '/upload/text',
+  requireMultipart,
   diskUpload.none(),
   asyncRoute(async function textOnlyRoute(req, res) {
-    if (
-      !req.body ||
-      Object.keys(req.body).length === 0
-    ) {
-      throw createHttpError(
-        400,
-        'At least one multipart text field is required'
-      );
+    const fieldCount = countTopLevelFields(req.body);
+
+    if (fieldCount === 0) {
+      throw createHttpError(400, 'INVALID_REQUEST');
     }
 
     res.status(200).json({
       success: true,
-      body: req.body
+      requestId: req.requestId,
+      fieldCount
     });
   })
 );
 
 app.post(
   '/upload/memory',
+  requireMultipart,
   memoryUpload.single('file'),
   asyncRoute(async function memoryUploadRoute(req, res) {
-    if (!req.file) {
-      throw createHttpError(
-        400,
-        'A file is required in the "file" field'
-      );
+    if (
+      !req.file ||
+      !Buffer.isBuffer(req.file.buffer)
+    ) {
+      throw createHttpError(400, 'INVALID_REQUEST');
     }
+
+    validateBufferType(
+      req.file.buffer,
+      req.file.mimetype
+    );
 
     res.status(201).json({
       success: true,
-      body: req.body,
-      file: {
-        fieldname: req.file.fieldname,
-        originalname: req.file.originalname,
-        encoding: req.file.encoding,
-        mimetype: req.file.mimetype,
-        size: req.file.size,
-        bufferLength: Buffer.isBuffer(req.file.buffer)
-          ? req.file.buffer.length
-          : 0
-      }
+      requestId: req.requestId,
+      file: serialiseFile(req.file)
     });
   })
 );
 
 app.use(
   '/form/fields',
-  exactPostOnly,
+  exactPostOnly('/form/fields'),
+  requireMultipart,
   diskUpload.none(),
   asyncRoute(async function formFieldsRoute(req, res) {
-    if (
-      !req.body ||
-      Object.keys(req.body).length === 0
-    ) {
-      throw createHttpError(
-        400,
-        'At least one multipart text field is required'
-      );
+    const fieldCount = countTopLevelFields(req.body);
+
+    if (fieldCount === 0) {
+      throw createHttpError(400, 'INVALID_REQUEST');
     }
 
     res.status(200).json({
       success: true,
-      body: req.body
+      requestId: req.requestId,
+      fieldCount
     });
   })
 );
 
 app.use(
   '/form/batch',
-  exactPostOnly,
+  exactPostOnly('/form/batch'),
+  requireMultipart,
   diskUpload.array('attachments', 2),
   asyncRoute(async function formBatchRoute(req, res) {
-    const files = Array.isArray(req.files)
-      ? req.files
-      : [];
+    const files = asFileArray(req.files);
 
     if (files.length === 0) {
-      throw createHttpError(
-        400,
-        'At least one file is required in the "attachments" field'
-      );
+      throw createHttpError(400, 'INVALID_REQUEST');
     }
+
+    await validateDiskFiles(files);
 
     res.status(201).json({
       success: true,
-      body: req.body,
+      requestId: req.requestId,
       fileCount: files.length,
-      files: files.map(serialiseDiskFile)
+      files: files.map(serialiseFile)
     });
   })
 );
@@ -367,9 +314,10 @@ app.use(
 app.use(function routeNotFoundHandler(req, res) {
   res.status(404).json({
     success: false,
+    requestId: req.requestId,
     error: {
-      code: 'ROUTE_NOT_FOUND',
-      message: `No route matches ${req.method} ${req.originalUrl}`
+      code: 'NOT_FOUND',
+      message: 'The requested resource was not found'
     }
   });
 });
@@ -386,50 +334,30 @@ app.use(async function globalErrorHandler(
 
   await removeRequestFiles(req);
 
-  if (error instanceof multer.MulterError) {
-    return res.status(multerStatusCode(error)).json({
-      success: false,
-      error: {
-        type: 'MulterError',
-        code: error.code,
-        message: error.message,
-        field: error.field || null,
-        storageErrors: Array.isArray(error.storageErrors)
-          ? error.storageErrors.map(normaliseStorageError)
-          : []
-      }
-    });
+  const response = publicErrorResponse(error);
+
+  if (response.statusCode >= 500) {
+    logInternalError(error, req);
   }
 
-  const statusCode = isValidStatusCode(error.statusCode)
-    ? error.statusCode
-    : 500;
-
-  if (statusCode >= 500) {
-    console.error('Unhandled request error:', error);
-  }
-
-  res.status(statusCode).json({
+  res.status(response.statusCode).json({
     success: false,
+    requestId: req.requestId,
     error: {
-      type: error.name || 'Error',
-      code: error.code || 'REQUEST_FAILED',
-      message: statusCode >= 500
-        ? 'The request could not be completed'
-        : error.message
+      code: response.code,
+      message: response.message
     }
   });
 });
 
 const server = app.listen(PORT, HOST, function onStarted() {
-  console.log(
-    `Upload test service listening at http://${HOST}:${PORT}`
-  );
+  console.log(`Upload service listening on ${HOST}:${PORT}`);
 });
 
 server.requestTimeout = 30_000;
 server.headersTimeout = 35_000;
 server.keepAliveTimeout = 5_000;
+server.maxHeadersCount = 100;
 
 let shutdownStarted = false;
 
@@ -439,10 +367,9 @@ function shutdown(signal) {
   }
 
   shutdownStarted = true;
-  console.log(`${signal} received. Closing server.`);
+  console.log(`Shutdown requested: ${signal}`);
 
   const forceShutdownTimer = setTimeout(function forceShutdown() {
-    console.error('Forced shutdown after timeout');
     process.exit(1);
   }, 10_000);
 
@@ -452,12 +379,11 @@ function shutdown(signal) {
     clearTimeout(forceShutdownTimer);
 
     if (error) {
-      console.error('Server shutdown failed:', error);
+      console.error('Server shutdown failed');
       process.exitCode = 1;
       return;
     }
 
-    console.log('Server closed cleanly');
     process.exitCode = 0;
   });
 }
@@ -471,42 +397,102 @@ process.on('SIGTERM', function onSigterm() {
 });
 
 process.on('uncaughtException', function onUncaughtException(error) {
-  console.error('Uncaught exception:', error);
+  console.error('Uncaught exception');
+  console.error(error);
   shutdown('uncaughtException');
 });
 
 process.on(
   'unhandledRejection',
   function onUnhandledRejection(reason) {
-    console.error('Unhandled promise rejection:', reason);
+    console.error('Unhandled promise rejection');
+    console.error(reason);
     shutdown('unhandledRejection');
   }
 );
 
-function exactPostOnly(req, res, next) {
-  if (req.path !== '/' && req.path !== '') {
-    return res.status(404).json({
-      success: false,
-      error: {
-        code: 'ROUTE_NOT_FOUND',
-        message: `No route matches ${req.method} ${req.originalUrl}`
-      }
-    });
-  }
+function assignRequestId(req, res, next) {
+  const requestId = crypto.randomUUID();
 
-  if (req.method !== 'POST') {
-    res.set('Allow', 'POST');
+  Object.defineProperty(req, 'requestId', {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: requestId
+  });
 
-    return res.status(405).json({
-      success: false,
-      error: {
-        code: 'METHOD_NOT_ALLOWED',
-        message: 'Only POST is allowed for this endpoint'
-      }
-    });
+  res.setHeader('X-Request-Id', requestId);
+  next();
+}
+
+function setSecurityHeaders(req, res, next) {
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'none'; frame-ancestors 'none'"
+  );
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader(
+    'Permissions-Policy',
+    'geolocation=(), microphone=(), camera=()'
+  );
+
+  next();
+}
+
+function requireMultipart(req, res, next) {
+  if (!req.is('multipart/form-data')) {
+    return next(
+      createHttpError(
+        415,
+        'UNSUPPORTED_MEDIA_TYPE'
+      )
+    );
   }
 
   next();
+}
+
+function exactPostOnly(expectedPath) {
+  return function exactPostOnlyMiddleware(req, res, next) {
+    const rawPath = getRawPath(req.originalUrl);
+
+    if (rawPath !== expectedPath) {
+      return res.status(404).json({
+        success: false,
+        requestId: req.requestId,
+        error: {
+          code: 'NOT_FOUND',
+          message: 'The requested resource was not found'
+        }
+      });
+    }
+
+    if (req.method !== 'POST') {
+      res.setHeader('Allow', 'POST');
+
+      return res.status(405).json({
+        success: false,
+        requestId: req.requestId,
+        error: {
+          code: 'METHOD_NOT_ALLOWED',
+          message: 'The request method is not allowed'
+        }
+      });
+    }
+
+    next();
+  };
+}
+
+function getRawPath(originalUrl) {
+  const queryIndex = originalUrl.indexOf('?');
+
+  return queryIndex === -1
+    ? originalUrl
+    : originalUrl.slice(0, queryIndex);
 }
 
 function asyncRoute(handler) {
@@ -515,10 +501,11 @@ function asyncRoute(handler) {
   };
 }
 
-function createHttpError(statusCode, message, code) {
-  const error = new Error(message);
+function createHttpError(statusCode, code) {
+  const error = new Error(code);
   error.statusCode = statusCode;
-  error.code = code || 'INVALID_REQUEST';
+  error.publicCode = code;
+
   return error;
 }
 
@@ -548,98 +535,55 @@ function ensureUploadDirectory(directory) {
       fs.constants.R_OK | fs.constants.W_OK
     );
   } catch (error) {
-    console.error(
-      `Upload directory is unavailable: ${directory}`,
-      error
-    );
-
+    console.error('Upload directory is unavailable');
     process.exit(1);
   }
 }
 
-function sanitiseExtension(extension) {
-  if (!extension) {
-    return '';
+function extensionForMimeType(mimeType) {
+  switch (mimeType) {
+    case 'application/pdf':
+      return '.pdf';
+
+    case 'image/jpeg':
+      return '.jpg';
+
+    case 'image/png':
+      return '.png';
+
+    default:
+      throw createHttpError(
+        415,
+        'UNSUPPORTED_MEDIA_TYPE'
+      );
   }
-
-  const normalised = extension
-    .toLowerCase()
-    .replace(/[^a-z0-9.]/g, '')
-    .slice(0, 10);
-
-  if (
-    normalised === '.' ||
-    !normalised.startsWith('.')
-  ) {
-    return '';
-  }
-
-  return normalised;
 }
 
-function serialiseDiskFile(file) {
+function serialiseFile(file) {
   return {
-    fieldname: file.fieldname,
-    originalname: file.originalname,
-    encoding: file.encoding,
     mimetype: file.mimetype,
-    destination: file.destination,
-    filename: file.filename,
-    path: file.path,
     size: file.size
   };
 }
 
-function multerStatusCode(error) {
-  switch (error.code) {
-    case 'LIMIT_FILE_SIZE':
-    case 'LIMIT_FIELD_VALUE':
-    case 'LIMIT_PART_COUNT':
-    case 'LIMIT_FILE_COUNT':
-    case 'LIMIT_FIELD_COUNT':
-      return 413;
-
-    case 'LIMIT_UNEXPECTED_FILE':
-    case 'LIMIT_FIELD_KEY':
-    case 'MISSING_FIELD_NAME':
-      return 400;
-
-    default:
-      return 400;
+function countTopLevelFields(body) {
+  if (
+    !body ||
+    typeof body !== 'object'
+  ) {
+    return 0;
   }
+
+  return Object.keys(body).length;
 }
 
-function isValidStatusCode(value) {
-  return Number.isInteger(value) &&
-    value >= 400 &&
-    value <= 599;
+function asFileArray(value) {
+  return Array.isArray(value)
+    ? value
+    : [];
 }
 
-function normaliseStorageError(error) {
-  return {
-    message: error && error.message
-      ? error.message
-      : 'Storage cleanup failed',
-
-    field: error &&
-      error.file &&
-      error.file.fieldname
-      ? error.file.fieldname
-      : null
-  };
-}
-
-async function removeRequestFiles(req) {
-  const files = collectDiskFiles(req);
-
-  await Promise.allSettled(
-    files.map(function removeFile(file) {
-      return fs.promises.unlink(file.path);
-    })
-  );
-}
-
-function collectDiskFiles(req) {
+function collectFilesFromRequest(req) {
   const files = [];
 
   if (req.file && isDiskFile(req.file)) {
@@ -652,7 +596,11 @@ function collectDiskFiles(req) {
         files.push(file);
       }
     }
-  } else if (
+
+    return files;
+  }
+
+  if (
     req.files &&
     typeof req.files === 'object'
   ) {
@@ -670,6 +618,190 @@ function collectDiskFiles(req) {
   }
 
   return files;
+}
+
+async function validateDiskFiles(files) {
+  try {
+    for (const file of files) {
+      const handle = await fs.promises.open(
+        file.path,
+        'r'
+      );
+
+      try {
+        const probe = Buffer.alloc(16);
+        const result = await handle.read(
+          probe,
+          0,
+          probe.length,
+          0
+        );
+
+        validateBufferType(
+          probe.subarray(0, result.bytesRead),
+          file.mimetype
+        );
+      } finally {
+        await handle.close();
+      }
+    }
+  } catch (error) {
+    throw createHttpError(
+      415,
+      'UNSUPPORTED_MEDIA_TYPE'
+    );
+  }
+}
+
+function validateBufferType(buffer, mimeType) {
+  const valid = (
+    mimeType === 'application/pdf' &&
+    startsWithBytes(
+      buffer,
+      [0x25, 0x50, 0x44, 0x46, 0x2d]
+    )
+  ) || (
+    mimeType === 'image/jpeg' &&
+    startsWithBytes(
+      buffer,
+      [0xff, 0xd8, 0xff]
+    )
+  ) || (
+    mimeType === 'image/png' &&
+    startsWithBytes(
+      buffer,
+      [
+        0x89,
+        0x50,
+        0x4e,
+        0x47,
+        0x0d,
+        0x0a,
+        0x1a,
+        0x0a
+      ]
+    )
+  );
+
+  if (!valid) {
+    throw createHttpError(
+      415,
+      'UNSUPPORTED_MEDIA_TYPE'
+    );
+  }
+}
+
+function startsWithBytes(buffer, bytes) {
+  if (
+    !Buffer.isBuffer(buffer) ||
+    buffer.length < bytes.length
+  ) {
+    return false;
+  }
+
+  return bytes.every(function matches(value, index) {
+    return buffer[index] === value;
+  });
+}
+
+function publicErrorResponse(error) {
+  if (error instanceof multer.MulterError) {
+    switch (error.code) {
+      case 'LIMIT_FILE_SIZE':
+      case 'LIMIT_FIELD_VALUE':
+      case 'LIMIT_PART_COUNT':
+      case 'LIMIT_FILE_COUNT':
+      case 'LIMIT_FIELD_COUNT':
+        return {
+          statusCode: 413,
+          code: 'PAYLOAD_TOO_LARGE',
+          message: 'The request exceeds the allowed limits'
+        };
+
+      default:
+        return {
+          statusCode: 400,
+          code: 'INVALID_REQUEST',
+          message: 'The request is invalid'
+        };
+    }
+  }
+
+  if (error && error.type === 'entity.too.large') {
+    return {
+      statusCode: 413,
+      code: 'PAYLOAD_TOO_LARGE',
+      message: 'The request exceeds the allowed limits'
+    };
+  }
+
+  if (
+    error &&
+    (
+      error.type === 'entity.parse.failed' ||
+      error instanceof SyntaxError
+    )
+  ) {
+    return {
+      statusCode: 400,
+      code: 'INVALID_REQUEST',
+      message: 'The request is invalid'
+    };
+  }
+
+  if (
+    error &&
+    error.statusCode === 415
+  ) {
+    return {
+      statusCode: 415,
+      code: 'UNSUPPORTED_MEDIA_TYPE',
+      message: 'The supplied media type is not supported'
+    };
+  }
+
+  if (
+    error &&
+    Number.isInteger(error.statusCode) &&
+    error.statusCode >= 400 &&
+    error.statusCode < 500
+  ) {
+    return {
+      statusCode: error.statusCode,
+      code: 'INVALID_REQUEST',
+      message: 'The request is invalid'
+    };
+  }
+
+  return {
+    statusCode: 500,
+    code: 'INTERNAL_ERROR',
+    message: 'The request could not be completed'
+  };
+}
+
+function logInternalError(error, req) {
+  console.error({
+    requestId: req.requestId,
+    method: req.method,
+    path: getRawPath(req.originalUrl),
+    errorName: error && error.name
+      ? error.name
+      : 'Error',
+    errorMessage: error && error.message
+      ? error.message
+      : 'Unknown error'
+  });
+}
+
+async function removeRequestFiles(req) {
+  const files = collectFilesFromRequest(req);
+
+  await Promise.allSettled(
+    files.map(function removeFile(file) {
+      return fs.promises.unlink(file.path);
+    })
+  );
 }
 
 function isDiskFile(file) {
