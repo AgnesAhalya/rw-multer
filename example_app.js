@@ -148,6 +148,15 @@ app.get('/', function indexRoute(req, res) {
         method: 'POST',
         path: '/upload/memory',
         fileField: 'file'
+      },
+      {
+        method: 'POST',
+        path: '/form/fields'
+      },
+      {
+        method: 'POST',
+        path: '/form/batch',
+        fileField: 'attachments'
       }
     ]
   });
@@ -308,6 +317,53 @@ app.post(
   })
 );
 
+app.use(
+  '/form/fields',
+  exactPostOnly,
+  diskUpload.none(),
+  asyncRoute(async function formFieldsRoute(req, res) {
+    if (
+      !req.body ||
+      Object.keys(req.body).length === 0
+    ) {
+      throw createHttpError(
+        400,
+        'At least one multipart text field is required'
+      );
+    }
+
+    res.status(200).json({
+      success: true,
+      body: req.body
+    });
+  })
+);
+
+app.use(
+  '/form/batch',
+  exactPostOnly,
+  diskUpload.array('attachments', 2),
+  asyncRoute(async function formBatchRoute(req, res) {
+    const files = Array.isArray(req.files)
+      ? req.files
+      : [];
+
+    if (files.length === 0) {
+      throw createHttpError(
+        400,
+        'At least one file is required in the "attachments" field'
+      );
+    }
+
+    res.status(201).json({
+      success: true,
+      body: req.body,
+      fileCount: files.length,
+      files: files.map(serialiseDiskFile)
+    });
+  })
+);
+
 app.use(function routeNotFoundHandler(req, res) {
   res.status(404).json({
     success: false,
@@ -426,6 +482,32 @@ process.on(
     shutdown('unhandledRejection');
   }
 );
+
+function exactPostOnly(req, res, next) {
+  if (req.path !== '/' && req.path !== '') {
+    return res.status(404).json({
+      success: false,
+      error: {
+        code: 'ROUTE_NOT_FOUND',
+        message: `No route matches ${req.method} ${req.originalUrl}`
+      }
+    });
+  }
+
+  if (req.method !== 'POST') {
+    res.set('Allow', 'POST');
+
+    return res.status(405).json({
+      success: false,
+      error: {
+        code: 'METHOD_NOT_ALLOWED',
+        message: 'Only POST is allowed for this endpoint'
+      }
+    });
+  }
+
+  next();
+}
 
 function asyncRoute(handler) {
   return function wrappedRoute(req, res, next) {
